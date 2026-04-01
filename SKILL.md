@@ -1,6 +1,6 @@
 ---
 name: cms-auth-skills
-description: cms基础 Skill — 登录授权、appKey 获取、access-token 获取
+description: CMS 基础鉴权 Skill — 为所有上层 Skill 提供 appKey 和 access-token。用户提到登录、授权、鉴权、token、appKey、协同 key、CWork Key、刷新权限、重新授权，或遇到 401/403/权限不足/未授权时，优先触发本 Skill。
 skillCode: cms-auth-skills
 ---
 
@@ -81,7 +81,7 @@ skillCode: cms-auth-skills
 
 - `appKey` 模式只传 `appKey`
 - `access-token` 模式只传 `access-token`
-- 不要给同一个业务接口同时传 `appKey` 和 `access-token`
+- 可以给一个业务接口同时传 `appKey` 和 `access-token`
 - `build_auth_headers()` 只负责返回鉴权 header，不附带其他通用 header
 - 对用户只输出结论或必要提示，不在面向用户的消息中回显 `appKey`、`access-token`、内部主键（脚本通过 stdout 管道传递鉴权值不受此约束）
 - 如果内部取值失败，直接跳到下一步，不向用户暴露中间缺失过程
@@ -270,61 +270,33 @@ headers = build_auth_headers("access-token", context=context)
 
 ---
 
-## 缓存机制
+## sessionKey 与命令行参数
 
-脚本支持将 `appKey` 和 `access-token` 缓存到 `cms-auth/auth.json` 文件中，以 `session_id` 为索引。
+### sessionKey 说明
 
-### 缓存文件格式
+`sessionKey` 是当前对话（会话）的唯一标识 ID。**它本质上就是当前这个对话/会话的会话 ID**，每一个对话都有一个唯一的 `sessionKey`。
 
-```json
-{
-  "sessions": {
-    "<session_id>": {
-      "appKey": "xxx",
-      "token": "xxx",
-      "updated_at": "2026-03-28T13:32:00+08:00"
-    }
-  }
-}
-```
-
-### 缓存策略
-
-1. **优先读缓存**：执行前先从 `auth.json` 按 `session_id` 查找；找到则直接返回，不走网络请求
-2. **回写缓存**：网络获取成功后，自动写回 `auth.json`
-3. **强制刷新**：通过 `--update` 参数跳过缓存，重新获取并更新
-4. **session_id 传入**：通过 `--session-id` 命令行参数传入
+- **来源**：从当前对话上下文中的 CDK（会话标识）提取。AI 在执行鉴权脚本时，应从当前对话的上下文中获取这个会话 ID 并作为 `sessionKey` 传入。`login.py` 不自行生成 `sessionKey`
+- **唯一性**：每个对话/会话有且仅有一个 `sessionKey`，不同对话的 `sessionKey` 不同
+- **用途**：同一会话内，脚本内部自动避免重复网络请求，不同会话互不干扰
+- **传入方式**：通过命令行参数 `--sessionKey` 传入
 
 ### 命令行示例
 
 ```bash
-# 使用缓存获取 appKey（首次会自动缓存）
-python login.py --resolve-app-key --session-id "my-session-id" \
+# 获取 appKey
+python login.py --resolve-app-key --sessionKey "my-sessionKey" \
   --context-json '{"account_id": "...", "send_id": "..."}'
 
-# 强制刷新缓存
-python login.py --ensure --session-id "my-session-id" --update \
+# 获取 access-token
+python login.py --ensure --sessionKey "my-sessionKey" \
+  --context-json '{"appKey": "..."}'
+
+# 强制重新获取（跳过已有结果）
+python login.py --ensure --sessionKey "my-sessionKey" --update \
   --context-json '{"appKey": "..."}'
 ```
 
-### 缓存文件位置
-
-`cms-auth/auth.json` 使用相对路径解析：
-
-- 如果 Skill 安装在 `<workspace>/skills/cms-auth-skills/`，则缓存写入 `<workspace>/cms-auth/auth.json`
-- 如果 Skill 仍处于旧结构 `<workspace>/cms-auth/skills/cms-auth-skills/`，则继续写入已有的 `<workspace>/cms-auth/auth.json`
-- 如果历史上误写到了 `<workspace>/skills/cms-auth/`，首次运行时会自动迁移到正确位置
-
----
-
-## 日志机制
-
-所有 API 调用都会记录日志到 `cms-auth/logs/` 目录，按日期命名文件。
-
-- 日志格式：`[时间戳] [级别] 详情`
-- 文件命名：`YYYY-MM-DD.log`（如 `2026-03-28.log`）
-- 自动清理超过 30 天的日志文件
-- token 值在日志中做脱敏处理（只显示前 6 位 + `***`）
 
 ---
 
@@ -333,35 +305,15 @@ python login.py --ensure --session-id "my-session-id" --update \
 1. **零依赖** — 仅 Python 标准库
 2. **stdout = 结果，stderr = 日志** — 便于管道组合
 3. **重试 3 次，间隔 1 秒** — 网络请求容错
-4. **缓存安全** — auth.json 文件权限应限制为当前用户可读写
-5. **日志脱敏** — 日志中 token 值做脱敏处理
+4. **日志脱敏** — 日志中 token 值做脱敏处理
 
 ---
 
-## 能力树
-
-```
-<workspace>/
-├── skills/
-│   └── cms-auth-skills/
-│       ├── SKILL.md
-│       └── scripts/
-│           └── auth/login.py
-└── cms-auth/                           # 缓存与日志（与 skills 同级）
-    ├── auth.json                       # key 缓存文件（session_id → appKey/token）
-    └── logs/                           # API 调用日志（按日期，保留 30 天）
-
-# 兼容旧结构时，若 Skill 位于 <workspace>/cms-auth/skills/cms-auth-skills/
-# 则继续复用已有的 <workspace>/cms-auth/ 目录
-```
+## 文件结构
 
 ```text
-cms-auth/                               # 兼容旧结构时的缓存与日志目录
-├── auth.json                           # key 缓存文件（session_id → appKey/token）
-└── logs/                               # API 调用日志（按日期，保留 30 天）
-
 cms-auth-skills/
-├── SKILL.md                            # 技能定义（本文件，包含所有规范与接口文档）
+├── SKILL.md                            # 技能定义（本文件）
 └── scripts/
-    └── auth/login.py                   # appKey/token 解析 + 鉴权 header 组装 + 缓存 + 日志
+    └── auth/login.py                   # appKey/token 解析 + 鉴权 header 组装
 ```

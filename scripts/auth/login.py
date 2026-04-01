@@ -3,14 +3,14 @@
 统一鉴权解析模块。
 
 对外只做三件事：
-- resolve_app_key(context, session_id)
-- ensure_token(context, session_id)
-- build_auth_headers(auth_mode, context, session_id)
+- resolve_app_key(context, sessionKey)
+- ensure_token(context, sessionKey)
+- build_auth_headers(auth_mode, context, sessionKey)
 
 约定：
 - login.py 不自己读取环境变量
 - 上层先确定鉴权方式，再把可用参数整理到 context
-- 支持通过 session_id 缓存 appKey/token 到 cms-auth/auth.json
+- 支持通过 sessionKey 缓存 appKey/token 到 cms-auth/auth.json
 - 所有 API 调用记录到 cms-auth/logs/ 目录
 """
 
@@ -18,17 +18,15 @@ import argparse
 import glob
 import json
 import os
+import ssl
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-import requests
-import warnings
-
-# 禁用 InsecureRequestWarning (因为 verify=False)
-warnings.filterwarnings("ignore", category=requests.packages.urllib3.exceptions.InsecureRequestWarning)
-import urllib.parse
 
 TOKEN_AUTH_URL = "https://sg-cwork-web.mediportal.com.cn/user/login/appkey"
 APP_CODE = "cms_gpt"
@@ -85,12 +83,23 @@ def _prepare_auth_dir(auth_dir: Path, skills_dir: Path | None = None) -> Path:
     return auth_dir
 
 
+def _build_auth_dir_candidate(skills_dir: Path) -> Path:
+    """基于 skills 目录推导对应的 cms-auth 目录。"""
+    return skills_dir.parent if skills_dir.parent.name == "cms-auth" else skills_dir.parent / "cms-auth"
+
+
 def _find_auth_dir(script_dir: Path | None = None, skill_dir: Path | None = None) -> Path:
     """
     通过相对路径解析 cms-auth 目录，不写死绝对路径。
 
     优先支持当前推荐结构：
         <workspace>/
+        ├── skills/
+        │   └── cms-auth-skills/scripts/auth/login.py
+        └── cms-auth/
+
+    同样支持类似安装结构：
+        ~/.opencalw/
         ├── skills/
         │   └── cms-auth-skills/scripts/auth/login.py
         └── cms-auth/
@@ -105,18 +114,24 @@ def _find_auth_dir(script_dir: Path | None = None, skill_dir: Path | None = None
 
     解析逻辑：
     1. 从 skill 目录向上查找祖先中的 skills/
-    2. 如果 skills 的父目录本身就是 cms-auth，则直接复用该目录
-    3. 否则固定把 cms-auth 放到 skills 的同级（即 skills 父目录下）
-    4. 如果整条路径中没有 skills/，才退回到 skill 目录的父级创建 cms-auth/
+    2. 优先复用这些 skills/ 对应的、已经存在的 cms-auth 目录
+    3. 如果 skills 的父目录本身就是 cms-auth，则直接复用该目录
+    4. 否则固定把 cms-auth 放到 skills 的同级（即 skills 父目录下）
+    5. 如果整条路径中没有 skills/，才退回到 skill 目录的父级创建 cms-auth/
     """
     script_dir = script_dir or Path(__file__).resolve().parent
     skill_dir = skill_dir or script_dir.parent.parent
 
-    for current in (skill_dir, *skill_dir.parents):
-        if current.name != "skills":
-            continue
+    skills_ancestors = [current for current in (skill_dir, *skill_dir.parents) if current.name == "skills"]
 
-        auth_dir = current.parent if current.parent.name == "cms-auth" else current.parent / "cms-auth"
+    for current in skills_ancestors:
+        auth_dir = _build_auth_dir_candidate(current)
+        if auth_dir.exists():
+            return _prepare_auth_dir(auth_dir, skills_dir=current)
+
+    if skills_ancestors:
+        current = skills_ancestors[0]
+        auth_dir = _build_auth_dir_candidate(current)
         return _prepare_auth_dir(auth_dir, skills_dir=current)
 
     fallback = skill_dir.parent / "cms-auth"
@@ -228,39 +243,40 @@ def _save_auth_cache(cache: dict):
         _write_log("ERROR", f"写入缓存文件失败: {e}")
 
 
-def _get_cached_value(session_id: str | None, key: str) -> str | None:
+def _get_cached_value(sessionKey: str | None, key: str) -> str | None:
     """从缓存中获取指定 session 的值"""
-    if not session_id:
+    if not sessionKey:
         return None
     cache = _load_auth_cache()
     sessions = cache.get("sessions", {})
-    session_data = sessions.get(session_id, {})
+    session_data = sessions.get(sessionKey, {})
     value = session_data.get(key)
     if value and isinstance(value, str) and value.strip():
-        _write_log("INFO", f"从缓存命中 {key} (session: {session_id[:8]}***)")
+        _write_log("INFO", f"从缓存命中 {key} (session: {sessionKey[:8]}***)")
         return value.strip()
     return None
 
 
-def _update_cache(session_id: str | None, key: str, value: str):
+def _update_cache(sessionKey: str | None, key: str, value: str):
     """更新缓存中的值"""
-    if not session_id or not value:
+    if not sessionKey or not value:
         return
     cache = _load_auth_cache()
     sessions = cache.setdefault("sessions", {})
-    session_data = sessions.setdefault(session_id, {})
+    session_data = sessions.setdefault(sessionKey, {})
     session_data[key] = value
     session_data["updated_at"] = datetime.now(_TZ_CN).isoformat()
     _save_auth_cache(cache)
-    _write_log("INFO", f"缓存已更新 {key} (session: {session_id[:8]}***)")
+    _write_log("INFO", f"缓存已更新 {key} (session: {sessionKey[:8]}***)")
 
 
 # ──────────────────────────────── 基础工具 ────────────────────────────────
 
 def _ssl_context():
-    # 使用 requests 时不再直接使用 ssl context，但保留此函数名
-    # 以防止其他地方有引用（虽然 grep 显示没有，但为了稳妥保留声明）
-    return None
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
 
 
 def _log(message: str, quiet: bool, level: str = "INFO"):
@@ -407,6 +423,11 @@ def _request_json(
     quiet: bool = False,
 ) -> dict[str, Any]:
     request_headers = dict(headers or {})
+    request_data = None
+
+    if body is not None:
+        request_headers.setdefault("Content-Type", "application/json")
+        request_data = json.dumps(body).encode("utf-8")
 
     # 记录完整请求日志（输入）
     log_headers = _json_for_log(request_headers)
@@ -422,47 +443,47 @@ def _request_json(
     _write_log("INFO", request_log)
     _stderr_log("INFO", request_log, quiet=quiet)
 
+    req = urllib.request.Request(
+        url,
+        data=request_data,
+        headers=request_headers,
+        method=method,
+    )
+
     try:
-        response = requests.request(
-            method,
-            url,
-            json=body,
-            headers=request_headers,
-            verify=False,
-            allow_redirects=True,
-            timeout=30,
-        )
-        status_code = response.status_code
-        resp_headers = dict(response.headers)
-        payload = response.json()
-    except requests.exceptions.HTTPError as e:
-        error_body = e.response.text if e.response else str(e)
+        with urllib.request.urlopen(req, context=_ssl_context(), timeout=30) as resp:
+            status_code = resp.status
+            resp_headers = dict(resp.headers)
+            raw_body = resp.read().decode("utf-8")
+            payload = json.loads(raw_body)
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8", errors="replace")
         error_log = (
             f"<<< API 响应失败\n"
             f"    Method : {method}\n"
             f"    URL    : {sanitized_url}\n"
-            f"    Status : {e.response.status_code if e.response else 'N/A'}\n"
+            f"    Status : {e.code}\n"
             f"    Body   : {error_body}"
         )
         _write_log("ERROR", error_log)
         _stderr_log("ERROR", error_log, quiet=quiet)
-        raise RuntimeError(f"请求失败 (HTTP {e.response.status_code if e.response else 'N/A'}): {error_body}") from e
-    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"请求失败 (HTTP {e.code}): {error_body}") from e
+    except urllib.error.URLError as e:
         error_log = (
             f"<<< API 请求失败\n"
             f"    Method : {method}\n"
             f"    URL    : {sanitized_url}\n"
-            f"    Error  : {str(e)}"
+            f"    Error  : {e.reason}"
         )
         _write_log("ERROR", error_log)
         _stderr_log("ERROR", error_log, quiet=quiet)
-        raise RuntimeError(f"请求失败: {str(e)}") from e
+        raise RuntimeError(f"请求失败: {e.reason}") from e
     except json.JSONDecodeError as e:
         error_log = (
             f"<<< API 响应 JSON 解析失败\n"
             f"    Method : {method}\n"
             f"    URL    : {sanitized_url}\n"
-            f"    Raw    : {response.text[:2000] if 'response' in locals() else 'N/A'}"
+            f"    Raw    : {raw_body[:2000] if 'raw_body' in dir() else 'N/A'}"
         )
         _write_log("ERROR", error_log)
         _stderr_log("ERROR", error_log, quiet=quiet)
@@ -473,7 +494,7 @@ def _request_json(
             f"<<< API 响应格式异常\n"
             f"    Method : {method}\n"
             f"    URL    : {sanitized_url}\n"
-            f"    Raw    : {response.text[:2000]}"
+            f"    Raw    : {raw_body[:2000]}"
         )
         _write_log("ERROR", error_log)
         _stderr_log("ERROR", error_log, quiet=quiet)
@@ -583,17 +604,16 @@ def _login_with_app_key(app_key: str, quiet: bool = False) -> dict[str, Any]:
     if not normalized_key:
         raise RuntimeError("登录失败：appKey 不能为空")
 
-    params = {"appCode": APP_CODE, "appKey": normalized_key}
+    query = urllib.parse.urlencode({"appCode": APP_CODE, "appKey": normalized_key})
+    request_url = f"{TOKEN_AUTH_URL}?{query}"
     _log(
         "开始调用 access-token 接口\n"
-        f"    URL    : {TOKEN_AUTH_URL}\n"
+        f"    URL    : {_sanitize_url(request_url)}\n"
         f"    appKey : {_masked_label(normalized_key)}",
         quiet,
     )
     try:
-        # 使用 requests 的 params 自动处理 query string
-        full_url = f"{TOKEN_AUTH_URL}?{urllib.parse.urlencode(params)}"
-        return _request_json(full_url, quiet=quiet)
+        return _request_json(request_url, quiet=quiet)
     except RuntimeError as exc:
         raise RuntimeError(f"登录失败: {exc}") from exc
 
@@ -617,33 +637,33 @@ def get_token(app_key: str, quiet: bool = False) -> str:
 def resolve_app_key(
     context: Any = None,
     quiet: bool = False,
-    session_id: str | None = None,
+    sessionKey: str | None = None,
     force_update: bool = False,
 ) -> str:
     _log_step(
         "开始解析 appKey\n"
-        f"    session_id : {_masked_label(session_id)}\n"
+        f"    sessionKey : {_masked_label(sessionKey)}\n"
         f"    force      : {force_update}\n"
         f"    context    : {_context_summary(context)}",
         quiet=quiet,
     )
 
-    # 1. 优先从缓存读取（非强制刷新时）
+    # 1. 优先从内部存储读取（非强制刷新时）——只写日志文件，不输出到 stderr
     if not force_update:
-        _log("检查 appKey 缓存", quiet)
-        cached = _get_cached_value(session_id, "appKey")
+        _write_log("INFO", "检查 appKey 内部存储")
+        cached = _get_cached_value(sessionKey, "appKey")
         if cached:
-            _log(f"已获取 appKey（缓存）: {_masked_label(cached)}", quiet)
+            _write_log("INFO", f"已获取 appKey（内部存储）: {_masked_label(cached)}")
             return cached
-        _log("appKey 缓存未命中", quiet)
+        _write_log("INFO", "appKey 内部存储未命中")
     else:
-        _log("已启用强制刷新，跳过 appKey 缓存", quiet)
+        _write_log("INFO", "已启用强制刷新，跳过 appKey 内部存储")
 
     # 2. 从 context 取
     app_key = extract_appkey_from_context(context)
     if app_key:
         _log(f"从 context 获取 appKey: {_masked_label(app_key)}", quiet)
-        _update_cache(session_id, "appKey", app_key)
+        _update_cache(sessionKey, "appKey", app_key)
         return app_key
     _log("context 中未提供 appKey", quiet)
 
@@ -660,47 +680,47 @@ def resolve_app_key(
         try:
             app_key = get_app_key_by_ding_user(account_id=account_id, send_id=send_id, quiet=quiet)
         except RuntimeError as exc:
-            _log_step("自动获取 appKey 失败，准备回退到用户输入", quiet=quiet, level="WARN")
+            _log_step(f"自动获取 appKey 失败，准备回退到用户输入 (sessionKey: {_masked_label(sessionKey)})", quiet=quiet, level="WARN")
             _log(str(exc), quiet, level="WARN")
             _raise_need_user_app_key()
         _log(f"已获取 appKey: {_masked_label(app_key)}", quiet)
-        _update_cache(session_id, "appKey", app_key)
+        _update_cache(sessionKey, "appKey", app_key)
         return app_key
 
-    _log_step("缺少 account_id 或 send_id，无法自动获取 appKey", quiet=quiet, level="WARN")
+    _log_step(f"缺少 account_id 或 send_id，无法自动获取 appKey (sessionKey: {_masked_label(sessionKey)})", quiet=quiet, level="WARN")
     _raise_need_user_app_key()
 
 
 def ensure_token(
     context: Any = None,
     quiet: bool = False,
-    session_id: str | None = None,
+    sessionKey: str | None = None,
     force_update: bool = False,
 ) -> str:
     _log_step(
         "开始解析 access-token\n"
-        f"    session_id : {_masked_label(session_id)}\n"
+        f"    sessionKey : {_masked_label(sessionKey)}\n"
         f"    force      : {force_update}\n"
         f"    context    : {_context_summary(context)}",
         quiet=quiet,
     )
 
-    # 1. 优先从缓存读取（非强制刷新时）
+    # 1. 优先从内部存储读取（非强制刷新时）——只写日志文件，不输出到 stderr
     if not force_update:
-        _log("检查 access-token 缓存", quiet)
-        cached = _get_cached_value(session_id, "token")
+        _write_log("INFO", "检查 access-token 内部存储")
+        cached = _get_cached_value(sessionKey, "token")
         if cached:
-            _log(f"已获取 access-token（缓存）: {_masked_label(cached)}", quiet)
+            _write_log("INFO", f"已获取 access-token（内部存储）: {_masked_label(cached)}")
             return cached
-        _log("access-token 缓存未命中", quiet)
+        _write_log("INFO", "access-token 内部存储未命中")
     else:
-        _log("已启用强制刷新，跳过 access-token 缓存", quiet)
+        _write_log("INFO", "已启用强制刷新，跳过 access-token 内部存储")
 
     # 2. 从 context 取
     token = extract_access_token_from_context(context)
     if token:
         _log(f"从 context 获取 access-token: {_masked_label(token)}", quiet)
-        _update_cache(session_id, "token", token)
+        _update_cache(sessionKey, "token", token)
         return token
     _log("context 中未提供 access-token，开始解析 appKey", quiet)
 
@@ -708,44 +728,44 @@ def ensure_token(
     try:
         app_key = resolve_app_key(
             context=context, quiet=True,
-            session_id=session_id, force_update=force_update,
+            sessionKey=sessionKey, force_update=force_update,
         )
     except RuntimeError as exc:
-        _log_step("解析 appKey 失败，无法继续换取 access-token", quiet=quiet, level="WARN")
+        _log_step(f"解析 appKey 失败，无法继续换取 access-token (sessionKey: {_masked_label(sessionKey)})", quiet=quiet, level="WARN")
         _log(str(exc), quiet, level="WARN")
         _raise_need_user_token()
 
     _log(f"开始使用 appKey 换取 access-token: {_masked_label(app_key)}", quiet)
     token = get_token(app_key, quiet=quiet)
     _log(f"已获取 access-token: {_masked_label(token)}", quiet)
-    _update_cache(session_id, "token", token)
+    _update_cache(sessionKey, "token", token)
     # 同时缓存 appKey
-    _update_cache(session_id, "appKey", app_key)
+    _update_cache(sessionKey, "appKey", app_key)
     return token
 
 
 def build_auth_headers(
     auth_mode: str,
     context: Any = None,
-    session_id: str | None = None,
+    sessionKey: str | None = None,
     force_update: bool = False,
 ) -> dict[str, str]:
     mode = (auth_mode or "none").strip().lower().replace("_", "-")
     headers: dict[str, str] = {}
-    _write_log("INFO", f"开始构建鉴权 headers auth_mode={mode} session={_masked_label(session_id)}")
+    _write_log("INFO", f"开始构建鉴权 headers auth_mode={mode} session={_masked_label(sessionKey)}")
 
     if mode in ("none", "nologin", "no-auth"):
         return headers
     if mode in ("appkey", "app-key"):
         headers["appKey"] = resolve_app_key(
             context=context, quiet=True,
-            session_id=session_id, force_update=force_update,
+            sessionKey=sessionKey, force_update=force_update,
         )
         return headers
     if mode in ("access-token", "token"):
         headers["access-token"] = ensure_token(
             context=context, quiet=True,
-            session_id=session_id, force_update=force_update,
+            sessionKey=sessionKey, force_update=force_update,
         )
         return headers
 
@@ -777,7 +797,7 @@ def main():
         default="access-token",
         help="header 模式：none / appKey / access-token（默认 access-token）",
     )
-    parser.add_argument("--session-id", type=str, default=None, help="会话 ID，用于缓存索引")
+    parser.add_argument("--sessionKey", type=str, default=None, help="对话中的标识取出的会话 key，用于缓存索引")
     parser.add_argument("--update", action="store_true", help="强制刷新缓存（跳过已有缓存，重新获取）")
     args = parser.parse_args()
 
@@ -785,7 +805,7 @@ def main():
     if args.app_key:
         context = _merge_context_app_key(context, args.app_key.strip())
 
-    session_id = args.session_id
+    sessionKey = args.sessionKey
     force_update = args.update
 
     execute_mode = (
@@ -794,23 +814,33 @@ def main():
         "resolve-app-key" if args.resolve_app_key else
         "login"
     )
-    _log_step(
+    # 完整信息（含路径）只写日志文件，不输出到 stderr，避免 AI 看到路径后去读取缓存文件
+    _write_log(
+        "INFO",
         "脚本启动\n"
         f"    mode      : {execute_mode}\n"
-        f"    session   : {_masked_label(session_id)}\n"
+        f"    sessionKey: {_masked_label(sessionKey)}\n"
         f"    update    : {force_update}\n"
         f"    auth_dir  : {_AUTH_DIR}\n"
         f"    auth_json : {_AUTH_JSON}\n"
         f"    log_file  : {_log_file_path()}\n"
         f"    context   : {_context_summary(context)}",
-        quiet=False,
+    )
+    # stderr 只输出不含路径的摘要
+    _stderr_log(
+        "INFO",
+        "脚本启动\n"
+        f"    mode      : {execute_mode}\n"
+        f"    sessionKey: {_masked_label(sessionKey)} (当前对话会话ID)\n"
+        f"    update    : {force_update}\n"
+        f"    context   : {_context_summary(context)}",
     )
 
     try:
         if args.headers:
             headers = build_auth_headers(
                 args.auth_mode, context=context,
-                session_id=session_id, force_update=force_update,
+                sessionKey=sessionKey, force_update=force_update,
             )
             _log("鉴权 headers 已生成，准备输出到 stdout", quiet=False)
             print(json.dumps(headers, ensure_ascii=False, indent=2), flush=True)
@@ -818,7 +848,7 @@ def main():
 
         if args.ensure:
             token = ensure_token(
-                context=context, session_id=session_id,
+                context=context, sessionKey=sessionKey,
                 force_update=force_update,
             )
             _log("access-token 已生成，准备输出到 stdout", quiet=False)
@@ -827,7 +857,7 @@ def main():
 
         if args.resolve_app_key:
             app_key = resolve_app_key(
-                context=context, session_id=session_id,
+                context=context, sessionKey=sessionKey,
                 force_update=force_update,
             )
             _log("appKey 已生成，准备输出到 stdout", quiet=False)
@@ -835,17 +865,17 @@ def main():
             return
 
         app_key = args.app_key.strip() if args.app_key else resolve_app_key(
-            context=context, session_id=session_id,
+            context=context, sessionKey=sessionKey,
             force_update=force_update,
         )
         token = get_token(app_key, quiet=False)
-        _update_cache(session_id, "token", token)
-        _update_cache(session_id, "appKey", app_key)
+        _update_cache(sessionKey, "token", token)
+        _update_cache(sessionKey, "appKey", app_key)
         _log("默认登录流程完成，准备输出 access-token 到 stdout", quiet=False)
         print(token, flush=True)
     except (RuntimeError, ValueError) as e:
-        _log_step("脚本执行失败", quiet=False, level="ERROR")
-        _log_step(str(e), quiet=False, level="ERROR")
+        _log_step(f"脚本执行失败 (sessionKey: {_masked_label(sessionKey)})", quiet=False, level="ERROR")
+        _log_step(f"{e} (sessionKey: {_masked_label(sessionKey)})", quiet=False, level="ERROR")
         print(f"错误: {e}", file=sys.stderr, flush=True)
         sys.exit(1)
 
